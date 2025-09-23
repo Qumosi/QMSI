@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.4;
 
 import "./Nibbstack/nf-token.sol";
 import "./Nibbstack/ownable.sol";
@@ -12,25 +12,39 @@ import {ERC20Spendable} from "./QMSIToken.sol";
 
 interface QMSI20 {
     function burnRate() external view returns (uint256);
+    function spend(uint256 value) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 abstract contract DeadmanSwitch is Ownable {
-    address private _kin;
-    uint256 private _timestamp;
+    // @notice Error handlers
+    error Unauthorized(address caller);
+    error InvalidRange(uint256 value);
+
+    // @notice Event for when deadman switch is set
+    event SetDeadSwitch(address indexed kin_, uint256 indexed days_);
+
+    address public _kin;
+    uint256 public _timestamp;
     constructor() {
         _kin = msg.sender;
         _timestamp = block.timestamp;
     }
-    // @notice Event for when deadman switch is set
-    event SetDeadSwitch(address indexed kin_, uint256 indexed days_);
+
     /**
     * @notice to be used by contract owner to set a deadman switch in the event of worse case scenario
     * @param kin_ the address of the next owner of the smart contract if the owner dies
     * @param days_ number of days from current time that the owner has to check-in prior to, otherwise the kin can claim ownership
     */
     function setDeadmanSwitch(address kin_, uint256 days_) onlyOwner external returns (bool){
-      require(days_ < 365, "QMSI-ERC721: Must check-in once a year");
-      require(kin_ != address(0), CANNOT_TRANSFER_TO_ZERO_ADDRESS);
+      // require(days_ < 365, "QMSI-ERC721: Must check-in once a year");
+      if(days_ > 365){
+        revert InvalidRange(days_);
+      }
+      // require(kin_ != address(0), CANNOT_TRANSFER_TO_ZERO_ADDRESS);
+      if(kin_ == address(0)){
+        revert Unauthorized(kin_);
+      }
       _kin = kin_;
       _timestamp = block.timestamp + (days_ * 1 days);
       emit SetDeadSwitch(kin_, days_);
@@ -41,30 +55,32 @@ abstract contract DeadmanSwitch is Ownable {
     * @return true on successful owner transfer
     */
     function claimSwitch() external returns (bool){
-      require(msg.sender == _kin, "QMSI-ERC721: Only next of kin can claim a deadman's switch");
-      require(block.timestamp > _timestamp, "QMSI-ERC721: Deadman is alive");
+      // require(msg.sender == _kin, "QMSI-ERC721: Only next of kin can claim a deadman's switch");
+      if(msg.sender != _kin){
+        revert Unauthorized(_kin);
+      }
+      // require(block.timestamp > _timestamp, "QMSI-ERC721: Deadman is alive");
+      if(block.timestamp < _timestamp){
+        revert InvalidRange(block.timestamp);
+      }
+
       emit OwnershipTransferred(owner, _kin);
       owner = _kin;
       return true;
-    }
-    /**
-    * @notice used to see who the next owner of the smart contract will be, if the switch expires
-    * @return the address of the next of kin
-    */
-    function getKin() public view virtual returns (address) {
-        return _kin;
-    }
-    /**
-    * @notice used to get the date that the switch expires to allow for claiming it
-    * @return the timestamp for which the switch expires
-    */
-    function getExpiry() public view virtual returns (uint256) {
-        return _timestamp;
     }
 }
 
 contract QMSI_721 is NFToken, DeadmanSwitch
 {
+    // @notice Error handlers
+    // error InsufficientBalance(uint256 available, uint256 required);
+    error TokenDoesNotExist(string tokenURI);
+    error SpendFailed(bool result);
+    error InvalidPrice(uint256 price);
+    error InvalidOption(uint256 option);
+    error NotRootToken(uint256 tokenId);
+    error InvalidQuantity(int32 quantity);
+
     // @notice Event for when NFT is sold
     event SoldNFT(address indexed seller, uint256 indexed tokenId, address indexed buyer);
 
@@ -89,6 +105,9 @@ contract QMSI_721 is NFToken, DeadmanSwitch
     // @notice Event for when NFT URI location changes
     event SetTokenURI(address indexed minter, uint256 indexed tokenId, string indexed tokenURI);
 
+    // @notice Event for when token type changes
+    event TransformToken(uint256 indexed tokenType, uint256 indexed tokenId, int32 indexed tokenQuantity);
+
     /// @notice The price to create new certificates
     uint256 _mintingPrice;
 
@@ -103,12 +122,26 @@ contract QMSI_721 is NFToken, DeadmanSwitch
     // ERC721 tokenURI standard
     mapping (uint256 => string) private _tokenURIs;
 
-    mapping (uint256 => uint256) private _tokenPrices;
+    // Mappings for token costs
+    mapping (uint256 => uint256) public tokenPrice;
 
     // Mappings for commission
-    mapping (uint256 => uint256) private _tokenCommission;
+    mapping (uint256 => uint256) public tokenCommission;
 
-    mapping (uint256 => address) private _tokenMinter;
+    // Mappings for original token minter
+    mapping (uint256 => address) public tokenMinter;
+
+    mapping (uint256 => uint256) public tokenType;
+    mapping (uint256 => uint256) public rootTokenId;
+    mapping (uint256 => int32) public tokenQuantity;
+
+    string private _name;
+    string private _symbol;
+
+    constructor() {
+        _name = "Qumosi (N)FT";
+        _symbol = "QMSI";
+    }
 
     /**
      * @notice Query the certificate hash for a token
@@ -162,6 +195,107 @@ contract QMSI_721 is NFToken, DeadmanSwitch
         emit SetMintCurrency(newMintingCurrency);
     }
 
+    /**
+     * @notice QMSI_721 Timeline ranking system by burning QMSI_20
+     * Designed to deter spam and keep what's relevant
+     * All users can help rank better content 
+     */
+    struct RankInfo {
+        uint256 tokenId;
+        uint256 amountBurned; // Total ERC20 burned
+        uint256 lastUpdateTime; // Timestamp of last ranking update
+    }
+    
+    mapping(uint256 => RankInfo) public timeBasedRanks; // For time-based ranking
+    mapping(uint256 => RankInfo) public amountBasedRanks; // For amount-based ranking
+    mapping(uint256 => uint256) public timeBasedAmount; // Tracks amount burned in the time window
+    mapping(uint256 => uint256) public overallAmountBurned; // Tracks total burned per token ID
+
+    uint256 public constant RANK_SIZE = 10000; // Maximum rank size
+    uint256 public constant TIME_WINDOW = 1 days; // Time window for time-based ranking
+
+    /**
+     * @notice this only works if the contract owns the token
+     * @dev Users spend their own ERC20 tokens to rank a token ID.
+     * @param tokenId The ID of the token being ranked
+     * @param amount The amount of ERC20 tokens to burn
+     */
+    function spendAndRank(uint256 tokenId, uint256 amount) internal {
+        // Need to send tokens to this contract first
+
+        // Burn the caller's tokens that were sent over
+        // require(_mintingCurrency.spend(amount), "QMSI-ERC721: Spend failed");
+        if(!(_mintingCurrency.spend(amount))){
+            revert SpendFailed(true);
+        }
+
+        // Update time-based and amount-based rankings
+        _updateTimeBasedRanking(tokenId, amount);
+        _updateAmountBasedRanking(tokenId, amount);
+    }
+
+    // Internal function to update the time-based ranking
+    function _updateTimeBasedRanking(uint256 tokenId, uint256 amount) internal {
+        uint256 currentTime = block.timestamp;
+
+        // Add to the token's time-based total without resetting the timer
+        timeBasedAmount[tokenId] += amount;
+
+        // If token is already ranked, update its amount
+        for (uint256 i = 0; i < RANK_SIZE; i++) {
+            if (timeBasedRanks[i].tokenId == tokenId) {
+                timeBasedRanks[i].amountBurned = timeBasedAmount[tokenId];
+
+                // Update the timestamp if 24 hours have passed
+                if (timeBasedRanks[i].lastUpdateTime + TIME_WINDOW < currentTime) {
+                    timeBasedRanks[i].lastUpdateTime = currentTime;
+                }
+                return;
+            }
+        }
+
+        // If not already ranked, try to insert it
+        for (uint256 i = 0; i < RANK_SIZE; i++) {
+            if (
+                timeBasedRanks[i].lastUpdateTime + TIME_WINDOW < currentTime || 
+                timeBasedAmount[tokenId] > timeBasedRanks[i].amountBurned
+            ) {
+                _shiftDown(timeBasedRanks, i);
+                timeBasedRanks[i] = RankInfo(tokenId, timeBasedAmount[tokenId], currentTime);
+                return;
+            }
+        }
+    }
+
+    // Internal function to update the amount-based ranking
+    function _updateAmountBasedRanking(uint256 tokenId, uint256 amount) internal {
+        overallAmountBurned[tokenId] += amount;
+
+        for (uint256 i = 0; i < RANK_SIZE; i++) {
+            if (amountBasedRanks[i].tokenId == tokenId) {
+                // If token is already ranked, update its amount
+                amountBasedRanks[i].amountBurned = overallAmountBurned[tokenId];
+                return;
+            }
+        }
+
+        // If not already ranked, try to insert it
+        for (uint256 i = 0; i < RANK_SIZE; i++) {
+            if (overallAmountBurned[tokenId] > amountBasedRanks[i].amountBurned) {
+                _shiftDown(amountBasedRanks, i);
+                amountBasedRanks[i] = RankInfo(tokenId, overallAmountBurned[tokenId], block.timestamp);
+                return;
+            }
+        }
+    }
+
+    // Helper function to shift ranking entries down from a given index
+    function _shiftDown(mapping(uint256 => RankInfo) storage ranks, uint256 index) internal {
+        for (uint256 i = RANK_SIZE - 1; i > index; i--) {
+            ranks[i] = ranks[i - 1];
+        }
+    }
+    
     // Base URI
     string private _baseURIextended;
 
@@ -196,7 +330,10 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function _setTokenURI(uint256 tokenId, string calldata _tokenURI) internal virtual {
-        require(bytes(_tokenURI).length > 0, "QMSI-ERC721: token URI cannot be empty");
+        // require(bytes(_tokenURI).length > 0, "QMSI-ERC721: token URI cannot be empty");
+        if(!(bytes(_tokenURI).length > 0)){
+            revert TokenDoesNotExist(_tokenURI);
+        }
         _tokenURIs[tokenId] = _tokenURI;
     }
 
@@ -207,8 +344,11 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function _setTokenCommissionProperty(uint256 tokenId, uint256 percentage) internal virtual{
-        require(percentage >= 0 && percentage <= 100, "QMSI-ERC721: Commission property must be a percent integer");
-        _tokenCommission[tokenId] = percentage;
+        // require(percentage >= 0 && percentage <= 100, "QMSI-ERC721: Commission property must be a percent integer");
+        if(!(percentage >= 0 && percentage <= 100)){
+            revert InvalidRange(percentage);
+        }
+        tokenCommission[tokenId] = percentage;
     }
 
     /**
@@ -218,9 +358,18 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function setTokenCommissionProperty(uint256 tokenId, uint256 percentage_) external{
-        require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
-        require(msg.sender == _tokenMinter[tokenId], "QMSI-ERC721: Must be the original minter to set commission rate");
-        require(percentage_ >= 0 && percentage_ <= 100, "QMSI-ERC721: Commission property must be a percent integer");
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
+        // require(msg.sender == _tokenMinter[tokenId], "QMSI-ERC721: Must be the original minter to set commission rate");
+        if(msg.sender != tokenMinter[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(percentage_ >= 0 && percentage_ <= 100, "QMSI-ERC721: Commission property must be a percent integer");
+        if(!(percentage_ >= 0 && percentage_ <= 100)){
+            revert InvalidRange(percentage_);
+        }
         _setTokenCommissionProperty(tokenId, percentage_);
         emit SetTokenCommission(msg.sender, tokenId, percentage_);
 
@@ -232,8 +381,11 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function _setTokenMinter(uint256 tokenId, address minter) internal virtual {
-        require(minter != address(0), "QMSI-ERC721: Invalid address");
-        _tokenMinter[tokenId] = minter;
+        // require(minter != address(0), "QMSI-ERC721: Invalid address");
+        if(minter == address(0)){
+            revert Unauthorized(address(0));
+        }
+        tokenMinter[tokenId] = minter;
     }
 
     /**
@@ -244,7 +396,7 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      */
     function _setTokenPrice(uint256 tokenId, uint256 _tokenPrice) internal virtual {
         if(_tokenPrice > 0){
-            _tokenPrices[tokenId] = _tokenPrice;
+            tokenPrice[tokenId] = _tokenPrice;
         }
     }
 
@@ -255,9 +407,18 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function sellToken(uint256 tokenId, uint256 _tokenPrice) external {
-        require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
-        require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to sell");
-        require(_tokenPrice > 0, "QMSI-ERC721: Must set a price to sell token for");
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
+        // require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to sell");
+        if(msg.sender != idToOwner[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(_tokenPrice > 0, "QMSI-ERC721: Must set a price to sell token for");
+        if(!(_tokenPrice > 0)){
+            revert InvalidPrice(_tokenPrice);
+        }
         _setTokenPrice(tokenId, _tokenPrice);
         emit SetNFTPrice(msg.sender, tokenId, _tokenPrice);
     }
@@ -268,10 +429,19 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function removeListing(uint256 tokenId) external {
-        require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
-        require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to remove listing");
-        require(_tokenPrices[tokenId] > 0, "QMSI-ERC721: Must be selling in order to remove listing");
-        _tokenPrices[tokenId] = 0;
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
+        // require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to remove listing");
+        if(msg.sender != idToOwner[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(_tokenPrices[tokenId] > 0, "QMSI-ERC721: Must be selling in order to remove listing");
+        if(!(tokenPrice[tokenId] > 0)){
+            revert InvalidPrice(tokenPrice[tokenId]);
+        }
+        tokenPrice[tokenId] = 0;
         emit SetNFTPrice(msg.sender, tokenId, 0);
     }
 
@@ -282,40 +452,67 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function setTokenURI(uint256 tokenId, string calldata _tokenURI) external {
-        require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
-        require(msg.sender == _tokenMinter[tokenId], "QMSI-ERC721: Must be the original minter to set URI");
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
+        // require(msg.sender == _tokenMinter[tokenId], "QMSI-ERC721: Must be the original minter to set URI");
+        if(msg.sender != tokenMinter[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
         _setTokenURI(tokenId, _tokenURI);
         emit SetTokenURI(msg.sender, tokenId, _tokenURI);
     }
 
     /**
-     * @notice the price of the certificate in token currency units, if there is one
-     * @param tokenId the id of the certificate that we want to the price of
-     * @return the amount in token currency the token is set to sell at
+     * @notice used for transforming token from non-fungible to fungible
+     * @param tokenId the id of the certificate that we want to set the type of
+     * @param quantity the number of tokens available, 0 for infinite
      *
      */
-    function tokenPrice(uint256 tokenId) external view returns (uint256) {
-        return _tokenPrices[tokenId];
-    }
+    function transformToken(uint256 tokenId, int32 quantity, uint256 ttype) external {
+        // require(_tokenType[tokenId] == 1, "QMSI-ERC721: Token already split");
+        if(tokenType[tokenId] != 1){
+            revert InvalidOption(tokenType[tokenId]);
+        }
+        // require(msg.sender == _tokenMinter[tokenId], "QMSI-ERC721: Must be the original minter to set tokenType");
+        if(msg.sender != tokenMinter[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to set tokenType");
+        if(msg.sender != idToOwner[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(tokenId == _rootTokenId[tokenId], "QMSI-ERC721: Can only change type on root token");
+        if(tokenId != rootTokenId[tokenId]){
+            revert NotRootToken(tokenId);
+        }
+        // quantity = -1 means unlimited
+        // quantity = 1 only one, NFT
+        // quantity = 1+, fungible
+        // require((quantity > 0 && quantity < 1000000) || quantity == -1, "QMSI-ERC721: Quantity must be zero to million"); // think of real max for overflows
+        if(ttype == 2){
+            // We are splitting the token
+            if(!((quantity > 0 && quantity < 1000000) || quantity == -1)){
+                revert InvalidQuantity(quantity);
+            }
+            tokenType[tokenId] = 2; // the token has been split
+            tokenQuantity[tokenId] = quantity;
+            emit TransformToken(2, tokenId, quantity);
+        }else if(ttype == 3){
+            // We are boosting the token
+            if(!((quantity > 0 && quantity < 1000000) || quantity == -1)){
+                revert InvalidQuantity(quantity);
+            }
+            tokenType[tokenId] = 3; // the token has been boosted
+            tokenQuantity[tokenId] = -1;
+            _transfer(address(this), tokenId);
+            _setTokenPrice(tokenId, uint256(quantity));
+            emit TransformToken(3, tokenId, -1);
+        }else{
+            revert InvalidOption(ttype);
+        }
 
-    /**
-     * @notice for finding the commission rate of a certificate, if there is one
-     * @param tokenId the id of the certificate that we want to know the commission rate
-     * @return the percent token commission rate that is taken by the original minter
-     *
-     */
-    function tokenCommission(uint256 tokenId) external view returns (uint256) {
-        return _tokenCommission[tokenId];
-    }
-
-    /**
-     * @notice for finding who the original minter of a certificate is
-     * @param tokenId the id of the certificate that we want to know the minter of
-     * @return the address of the original minter of the certificate
-     *
-     */
-    function tokenMinter(uint256 tokenId) external view returns (address) {
-        return _tokenMinter[tokenId];
     }
 
     /**
@@ -325,10 +522,51 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function buyToken(address from, uint256 tokenId) external {
-        require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
-        require(msg.sender == address(_mintingCurrency), "QMSI-ERC721: Only the set currency can buy NFT on behalf of the user");
-        _transfer(from, tokenId);
-        _tokenPrices[tokenId] = 0;
+        // require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
+        if(_isContract(msg.sender) == false){
+            revert Unauthorized(msg.sender);
+        }
+        // require(msg.sender == address(_mintingCurrency), "QMSI-ERC721: Only the set currency can buy NFT on behalf of the user");
+        if(msg.sender != address(_mintingCurrency)){
+            revert Unauthorized(msg.sender);
+        }
+        // require(_quantity[tokenId] > 0 || _quantity[tokenId] == -1, "QMSI-ERC721: Not enough tokens left");
+        if(!(tokenQuantity[tokenId] > 0 || tokenQuantity[tokenId] == -1)){
+            revert InvalidQuantity(tokenQuantity[tokenId]);
+        }
+        if(tokenType[tokenId] == 1){
+            _transfer(from, tokenId);
+            tokenPrice[tokenId] = 0;
+        }else if(tokenType[tokenId] == 3){
+            if(idToOwner[tokenId] == address(this)) {
+                // the idea is simple, send the multi token to this contract to own
+                // once owned, you can "buy" as many, whomever and 
+                // increment the rankings 
+
+               // calculate the real price with comission applied and only burn the amount given to the owner, this contract
+               uint256 tokenCommission_ = this.tokenCommission(tokenId);
+               uint256 tokenPrice_ = this.tokenPrice(tokenId);
+
+               uint256 amount = tokenPrice_;
+               if(tokenCommission_ > 0){
+                amount = (tokenPrice_ * (100 - tokenCommission_)) / 100;
+               }
+
+               spendAndRank(tokenId, amount);
+            }else{
+                revert Unauthorized(idToOwner[tokenId]);
+            }   
+        }else if(tokenType[tokenId] == 2){
+            if(tokenQuantity[tokenId] > 0){
+                tokenQuantity[tokenId]--; // deduct from quantity
+            }
+            uint256 newToken = this.create(certificateDataHashes[tokenId], _tokenURIs[tokenId], 0, tokenCommission[tokenId], tokenMinter[tokenId], rootTokenId[tokenId]);
+            _transfer(from, newToken);
+        }else{
+            revert InvalidOption(tokenType[tokenId]);
+        }
+        // if token quantity is infinite lock the token to type 2, if it is limited prevent ability to upgrade
+        // we need to store the original token id of the top most token
         emit SoldNFT(idToOwner[tokenId], tokenId, from);
     }
 
@@ -348,8 +586,10 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function tokenURI(uint256 tokenId) public view virtual returns (string memory) {
-        require(bytes(_tokenURIs[tokenId]).length > 0, "ERC721Metadata: URI query for nonexistent token");
-
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "ERC721Metadata: URI query for nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
         string memory _tokenURI = _tokenURIs[tokenId];
         string memory base = _baseURIextended;
 
@@ -377,8 +617,57 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function create(bytes32 dataHash, string calldata tokenURI_, uint256 tokenPrice_, uint256 commission_, address minter_) external returns (uint) {
-        require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
-        require(msg.sender == address(_mintingCurrency), "QMSI-ERC721: Only the set currency can create NFT on behalf of the user");
+        // require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
+        if(_isContract(msg.sender) == false){
+            revert Unauthorized(msg.sender);
+        }
+        // require(msg.sender == address(_mintingCurrency), "QMSI-ERC721: Only the set currency can create NFT on behalf of the user");
+        if(msg.sender != address(_mintingCurrency)){
+            revert Unauthorized(msg.sender);
+        }
+        // All tokens start as NFTs and can be converted into FTs that can be minted over and over
+        tokenType[nextCertificateId] = 1;
+        tokenQuantity[nextCertificateId] = 1;
+
+        // root most tokenid gets set here
+        rootTokenId[nextCertificateId] = nextCertificateId;
+
+        // Set URI of token
+        _setTokenURI(nextCertificateId, tokenURI_);
+
+        // Set price of token (optional)
+        _setTokenPrice(nextCertificateId, tokenPrice_);
+
+        // Set token minter (the original artist)
+        _setTokenMinter(nextCertificateId, minter_);
+        _setTokenCommissionProperty(nextCertificateId, commission_);
+
+        // Create the certificate
+        uint256 newCertificateId = nextCertificateId;
+        _mint(minter_, newCertificateId);
+        certificateDataHashes[newCertificateId] = dataHash;
+        nextCertificateId = nextCertificateId + 1;
+        // Emit that we minted an NFT
+        emit MintedNFT(minter_, newCertificateId);
+
+        return newCertificateId;
+    }
+
+    function create(bytes32 dataHash, string calldata tokenURI_, uint256 tokenPrice_, uint256 commission_, address minter_, uint256 rootTokenId_) external returns (uint) {
+        // require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
+        if(_isContract(msg.sender) == false){
+            revert Unauthorized(msg.sender);
+        }
+        // require(msg.sender == address(this), "QMSI-ERC721: Only the current address can create NFT on behalf of the user");
+        if(msg.sender != address(this)){
+            revert Unauthorized(msg.sender);
+        }
+        // All tokens start as NFTs and can be converted into FTs that can be minted over and over
+        tokenType[nextCertificateId] = 1;
+        tokenQuantity[nextCertificateId] = 1;
+
+        // Passed down from buyToken call
+        rootTokenId[nextCertificateId] = rootTokenId_;
 
         // Set URI of token
         _setTokenURI(nextCertificateId, tokenURI_);

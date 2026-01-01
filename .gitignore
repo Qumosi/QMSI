@@ -2,3 +2,4 @@ node_modules/
 tests/
 .deps/
 artifacts
+.states/vm-prague/state.json

@@ -1,77 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.4;
 
-import "./Nibbstack/nf-token.sol";
-import "./Nibbstack/ownable.sol";
+import "./OpenZeppelin/ReentrancyGuardTransient.sol";
 import "./OpenZeppelin/Strings.sol";
+import "./qlibs/deadman.sol";
+import "./qlibs/zkp.sol";
 import {ERC20Spendable} from "./QMSIToken.sol";
 
 /**
  * @notice A non-fungible certificate that anybody can create by spending tokens
  */
 
-interface QMSI20 {
-    function burnRate() external view returns (uint256);
-    function spend(uint256 value) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
-
-abstract contract DeadmanSwitch is Ownable {
-    // @notice Error handlers
-    error Unauthorized(address caller);
-    error InvalidRange(uint256 value);
-
-    // @notice Event for when deadman switch is set
-    event SetDeadSwitch(address indexed kin_, uint256 indexed days_);
-
-    address public _kin;
-    uint256 public _timestamp;
-    constructor() {
-        _kin = msg.sender;
-        _timestamp = block.timestamp;
-    }
-
-    /**
-    * @notice to be used by contract owner to set a deadman switch in the event of worse case scenario
-    * @param kin_ the address of the next owner of the smart contract if the owner dies
-    * @param days_ number of days from current time that the owner has to check-in prior to, otherwise the kin can claim ownership
-    */
-    function setDeadmanSwitch(address kin_, uint256 days_) onlyOwner external returns (bool){
-      // require(days_ < 365, "QMSI-ERC721: Must check-in once a year");
-      if(days_ > 365){
-        revert InvalidRange(days_);
-      }
-      // require(kin_ != address(0), CANNOT_TRANSFER_TO_ZERO_ADDRESS);
-      if(kin_ == address(0)){
-        revert Unauthorized(kin_);
-      }
-      _kin = kin_;
-      _timestamp = block.timestamp + (days_ * 1 days);
-      emit SetDeadSwitch(kin_, days_);
-      return true;
-    }
-    /**
-    * @notice to be used by the next of kin to claim ownership of the smart contract if the time has expired
-    * @return true on successful owner transfer
-    */
-    function claimSwitch() external returns (bool){
-      // require(msg.sender == _kin, "QMSI-ERC721: Only next of kin can claim a deadman's switch");
-      if(msg.sender != _kin){
-        revert Unauthorized(_kin);
-      }
-      // require(block.timestamp > _timestamp, "QMSI-ERC721: Deadman is alive");
-      if(block.timestamp < _timestamp){
-        revert InvalidRange(block.timestamp);
-      }
-
-      emit OwnershipTransferred(owner, _kin);
-      owner = _kin;
-      return true;
-    }
-}
-
-contract QMSI_721 is NFToken, DeadmanSwitch
+contract QMSI_721 is SecureZKP, DeadmanSwitch, ReentrancyGuardTransient
 {
+    using TransientSlot for bytes32;
     // @notice Error handlers
     // error InsufficientBalance(uint256 available, uint256 required);
     error TokenDoesNotExist(string tokenURI);
@@ -139,9 +81,10 @@ contract QMSI_721 is NFToken, DeadmanSwitch
     string private _symbol;
 
     constructor() {
-        _name = "Qumosi (N)FT";
+        _name = "Qumosi Market";
         _symbol = "QMSI";
     }
+
 
     /**
      * @notice Query the certificate hash for a token
@@ -211,7 +154,7 @@ contract QMSI_721 is NFToken, DeadmanSwitch
     mapping(uint256 => uint256) public timeBasedAmount; // Tracks amount burned in the time window
     mapping(uint256 => uint256) public overallAmountBurned; // Tracks total burned per token ID
 
-    uint256 public constant RANK_SIZE = 10000; // Maximum rank size
+    uint256 public constant RANK_SIZE = 100; // Maximum rank size
     uint256 public constant TIME_WINDOW = 1 days; // Time window for time-based ranking
 
     /**
@@ -220,7 +163,7 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      * @param tokenId The ID of the token being ranked
      * @param amount The amount of ERC20 tokens to burn
      */
-    function spendAndRank(uint256 tokenId, uint256 amount) internal {
+    function _spendAndRank(uint256 tokenId, uint256 amount) internal {
         // Need to send tokens to this contract first
 
         // Burn the caller's tokens that were sent over
@@ -471,6 +414,9 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      *
      */
     function transformToken(uint256 tokenId, int32 quantity, uint256 ttype) external {
+        _transformToken(tokenId, quantity, ttype);
+    }
+    function _transformToken(uint256 tokenId, int32 quantity, uint256 ttype) internal {
         // require(_tokenType[tokenId] == 1, "QMSI-ERC721: Token already split");
         if(tokenType[tokenId] != 1){
             revert InvalidOption(tokenType[tokenId]);
@@ -501,18 +447,31 @@ contract QMSI_721 is NFToken, DeadmanSwitch
             emit TransformToken(2, tokenId, quantity);
         }else if(ttype == 3){
             // We are boosting the token
-            if(!((quantity > 0 && quantity < 1000000) || quantity == -1)){
-                revert InvalidQuantity(quantity);
-            }
             tokenType[tokenId] = 3; // the token has been boosted
             tokenQuantity[tokenId] = -1;
             _transfer(address(this), tokenId);
-            _setTokenPrice(tokenId, uint256(quantity));
             emit TransformToken(3, tokenId, -1);
         }else{
             revert InvalidOption(ttype);
         }
 
+    }
+    // To allow for setting the price safely otherwise someone can snatch the NFT before you can split it
+    function safeBoostToken(uint256 tokenId, uint256 _tokenPrice) external {
+        // require(bytes(_tokenURIs[tokenId]).length > 0, "QMSI-ERC721: Nonexistent token");
+        if(!(bytes(_tokenURIs[tokenId]).length > 0)){
+            revert TokenDoesNotExist(_tokenURIs[tokenId]);
+        }
+        // require(msg.sender == idToOwner[tokenId], "QMSI-ERC721: Must own token in order to sell");
+        if(msg.sender != idToOwner[tokenId]){
+            revert Unauthorized(msg.sender);
+        }
+        // require(_tokenPrice > 0, "QMSI-ERC721: Must set a price to sell token for");
+        if(!(_tokenPrice > 0)){
+            revert InvalidPrice(_tokenPrice);
+        }
+        _setTokenPrice(tokenId, _tokenPrice);
+        _transformToken(tokenId, 1, 3);
     }
 
     /**
@@ -521,7 +480,10 @@ contract QMSI_721 is NFToken, DeadmanSwitch
      * @param tokenId the id of the NFT we are moving
      *
      */
-    function buyToken(address from, uint256 tokenId) external {
+    function buyToken(address from, uint256 tokenId) external nonReentrant returns (bool) {
+        return _buyToken(from, tokenId);
+    }
+    function _buyToken(address from, uint256 tokenId) internal returns (bool) {
         // require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
         if(_isContract(msg.sender) == false){
             revert Unauthorized(msg.sender);
@@ -534,6 +496,10 @@ contract QMSI_721 is NFToken, DeadmanSwitch
         if(!(tokenQuantity[tokenId] > 0 || tokenQuantity[tokenId] == -1)){
             revert InvalidQuantity(tokenQuantity[tokenId]);
         }
+        // require that a public key is not set otherwise can redeem later
+        if(tokenPublicKey[tokenId] != address(0)){
+            revert Unauthorized(msg.sender);
+        }
         if(tokenType[tokenId] == 1){
             _transfer(from, tokenId);
             tokenPrice[tokenId] = 0;
@@ -544,15 +510,15 @@ contract QMSI_721 is NFToken, DeadmanSwitch
                 // increment the rankings 
 
                // calculate the real price with comission applied and only burn the amount given to the owner, this contract
-               uint256 tokenCommission_ = this.tokenCommission(tokenId);
-               uint256 tokenPrice_ = this.tokenPrice(tokenId);
+               uint256 tokenCommission_ = tokenCommission[tokenId];
+               uint256 tokenPrice_ = tokenPrice[tokenId];
 
                uint256 amount = tokenPrice_;
                if(tokenCommission_ > 0){
                 amount = (tokenPrice_ * (100 - tokenCommission_)) / 100;
                }
 
-               spendAndRank(tokenId, amount);
+               _spendAndRank(tokenId, amount);
             }else{
                 revert Unauthorized(idToOwner[tokenId]);
             }   
@@ -560,7 +526,7 @@ contract QMSI_721 is NFToken, DeadmanSwitch
             if(tokenQuantity[tokenId] > 0){
                 tokenQuantity[tokenId]--; // deduct from quantity
             }
-            uint256 newToken = this.create(certificateDataHashes[tokenId], _tokenURIs[tokenId], 0, tokenCommission[tokenId], tokenMinter[tokenId], rootTokenId[tokenId]);
+            uint256 newToken = _create(certificateDataHashes[tokenId], _tokenURIs[tokenId], 0, tokenCommission[tokenId], tokenMinter[tokenId], rootTokenId[tokenId]);
             _transfer(from, newToken);
         }else{
             revert InvalidOption(tokenType[tokenId]);
@@ -568,6 +534,8 @@ contract QMSI_721 is NFToken, DeadmanSwitch
         // if token quantity is infinite lock the token to type 2, if it is limited prevent ability to upgrade
         // we need to store the original token id of the top most token
         emit SoldNFT(idToOwner[tokenId], tokenId, from);
+
+        return true;
     }
 
     /**
@@ -653,15 +621,8 @@ contract QMSI_721 is NFToken, DeadmanSwitch
         return newCertificateId;
     }
 
-    function create(bytes32 dataHash, string calldata tokenURI_, uint256 tokenPrice_, uint256 commission_, address minter_, uint256 rootTokenId_) external returns (uint) {
-        // require(_isContract(msg.sender) == true, "QMSI-ERC721: Only contract addresses can use this function");
-        if(_isContract(msg.sender) == false){
-            revert Unauthorized(msg.sender);
-        }
-        // require(msg.sender == address(this), "QMSI-ERC721: Only the current address can create NFT on behalf of the user");
-        if(msg.sender != address(this)){
-            revert Unauthorized(msg.sender);
-        }
+    // Overloading for split tokens
+    function _create(bytes32 dataHash, string memory tokenURI_, uint256 tokenPrice_, uint256 commission_, address minter_, uint256 rootTokenId_) internal returns (uint) {
         // All tokens start as NFTs and can be converted into FTs that can be minted over and over
         tokenType[nextCertificateId] = 1;
         tokenQuantity[nextCertificateId] = 1;
@@ -669,8 +630,11 @@ contract QMSI_721 is NFToken, DeadmanSwitch
         // Passed down from buyToken call
         rootTokenId[nextCertificateId] = rootTokenId_;
 
-        // Set URI of token
-        _setTokenURI(nextCertificateId, tokenURI_);
+        // Set URI of token (here twice due to calldata vs memory
+        if(!(bytes(tokenURI_).length > 0)){
+            revert TokenDoesNotExist(tokenURI_);
+        }
+        _tokenURIs[nextCertificateId] = tokenURI_;
 
         // Set price of token (optional)
         _setTokenPrice(nextCertificateId, tokenPrice_);

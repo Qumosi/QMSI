@@ -37,7 +37,7 @@ The following are promises this ERC721 smart contract aims to accomplish:
 ## Using mainnet
 The following contract addresses can be found on the Ethereum mainnet
 * QMSI-ERC20: [0x1B06DfdcE22bE46C89ECF43EE72C6D710F4A46fC](https://etherscan.io/address/0x1b06dfdce22be46c89ecf43ee72c6d710f4a46fc#code)
-* QMSI-ERC721: [0xA0D1025bC39106b04B755b96645498f351781B33](https://etherscan.io/address/0xa0d1025bc39106b04b755b96645498f351781b33#code)
+* QMSI-ERC721: [0x83f7D4874780c23A26b97cc02863044d5056618D](https://etherscan.io/address/0x83f7d4874780c23a26b97cc02863044d5056618d#code)
 
 ### Using testnet
 The following contract addresses can be found on the Goerli testnet
